@@ -1,0 +1,67 @@
+name: Split encrypted Android tool transfer
+on:
+  push:
+    branches: ['build/public-tools-transfer-parts-20261025']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [compiler, emulator]
+    steps:
+      - name: Retrieve existing encrypted tool bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          NAME="public-android-$KIND-transfer"
+          for TRY in $(seq 1 60); do
+            COUNT=$(gh api "repos/$REPO/actions/runs/40179397317/artifacts" --jq "[.artifacts[] | select(.name == \"$NAME\")] | length")
+            if [ "$COUNT" -gt 0 ]; then break; fi
+            sleep 10
+          done
+          mkdir -p "$RUNNER_TEMP/input" "$RUNNER_TEMP/parts"
+          gh run download 40179397317 --repo "$REPO" --name "$NAME" --dir "$RUNNER_TEMP/input"
+          split -b 300M -d -a 2 "$RUNNER_TEMP/input/tools.enc" "$RUNNER_TEMP/input/tools.enc.part"
+          for FILE in "$RUNNER_TEMP/input/"tools.enc.part*; do
+            PART="${FILE##*.part}"
+            mkdir -p "$RUNNER_TEMP/parts/$PART"
+            mv "$FILE" "$RUNNER_TEMP/parts/$PART/"
+          done
+          cp "$RUNNER_TEMP/input/key.enc" "$RUNNER_TEMP/input/sha256.txt" "$RUNNER_TEMP/parts/00/"
+          find "$RUNNER_TEMP/parts" -type f -printf '%f %s bytes\n'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.kind }}-part00
+          path: ${{ runner.temp }}/parts/00/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.kind }}-part01
+          path: ${{ runner.temp }}/parts/01/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.kind }}-part02
+          path: ${{ runner.temp }}/parts/02/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.kind }}-part03
+          path: ${{ runner.temp }}/parts/03/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: ignore
