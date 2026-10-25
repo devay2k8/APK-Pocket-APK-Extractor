@@ -1,0 +1,183 @@
+name: Isolated public Android build tools
+on:
+  push:
+    branches: ['build/public-android-tools-20261025']
+permissions:
+  contents: read
+jobs:
+  transfer-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - run: echo 'Public Android tool transfer check. No application source.' > transfer-check.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-android-transfer-check
+          path: transfer-check.txt
+          retention-days: 1
+  tools:
+    needs: transfer-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [compiler, emulator]
+    steps:
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
+          log-accepted-android-sdk-licenses: false
+      - name: Prepare compiler and public dependency cache
+        if: matrix.kind == 'compiler'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'platform-tools'
+          ROOT="$RUNNER_TEMP/android-tools"
+          mkdir -p "$ROOT"
+          cd "$ROOT"
+          curl --fail --location --retry 3 https://services.gradle.org/distributions/gradle-8.11.1-bin.zip -o gradle.zip
+          SUM=$(curl --fail --location --retry 3 https://services.gradle.org/distributions/gradle-8.11.1-bin.zip.sha256)
+          echo "$SUM  gradle.zip" | sha256sum -c -
+          unzip -q gradle.zip
+          rm gradle.zip
+          export PATH="$ROOT/gradle-8.11.1/bin:$PATH"
+          mkdir -p "$RUNNER_TEMP/dependency-bootstrap"
+          cd "$RUNNER_TEMP/dependency-bootstrap"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          files = {
+          'settings.gradle.kts': '''pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
+          rootProject.name = "DependencyBootstrap"
+          include(":app")
+          ''',
+          'build.gradle.kts': '''plugins {
+            id("com.android.application") version "8.9.2" apply false
+            id("org.jetbrains.kotlin.android") version "2.1.20" apply false
+            id("org.jetbrains.kotlin.plugin.compose") version "2.1.20" apply false
+          }
+          ''',
+          'gradle.properties': 'org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8\nandroid.useAndroidX=true\nkotlin.code.style=official\nandroid.nonTransitiveRClass=true\n',
+          'app/build.gradle.kts': '''plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+            id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+            namespace = "com.example.dependencybootstrap"
+            compileSdk = 35
+            defaultConfig {
+              applicationId = "com.example.dependencybootstrap"
+              minSdk = 29
+              targetSdk = 35
+              versionCode = 1
+              versionName = "1.0"
+              testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+            }
+            compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = "17" }
+            buildFeatures { compose = true; buildConfig = true }
+            packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+          }
+          dependencies {
+            implementation("androidx.core:core-ktx:1.15.0")
+            implementation(platform("androidx.compose:compose-bom:2025.04.01"))
+            implementation("androidx.activity:activity-compose:1.10.1")
+            implementation("androidx.compose.ui:ui")
+            implementation("androidx.compose.ui:ui-tooling-preview")
+            implementation("androidx.compose.foundation:foundation")
+            implementation("androidx.compose.material3:material3")
+            implementation("androidx.compose.material:material-icons-extended")
+            implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+            implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+            implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+            implementation("androidx.work:work-runtime-ktx:2.10.1")
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+            testImplementation("junit:junit:4.13.2")
+            androidTestImplementation(platform("androidx.compose:compose-bom:2025.04.01"))
+            androidTestImplementation("androidx.compose.ui:ui-test-junit4")
+            androidTestImplementation("androidx.test.ext:junit:1.2.1")
+            androidTestImplementation("androidx.test:core-ktx:1.6.1")
+            androidTestImplementation("androidx.test:runner:1.6.2")
+            debugImplementation("androidx.compose.ui:ui-tooling")
+            debugImplementation("androidx.compose.ui:ui-test-manifest")
+          }
+          ''',
+          'app/src/main/AndroidManifest.xml': '<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:label="Dependency bootstrap"><activity android:name=".MainActivity" android:exported="true"><intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity></application></manifest>',
+          'app/src/main/java/com/example/dependencybootstrap/MainActivity.kt': '''package com.example.dependencybootstrap
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.material3.Text
+          class MainActivity : ComponentActivity() { override fun onCreate(savedInstanceState: Bundle?) { super.onCreate(savedInstanceState); setContent { Text("Dependency bootstrap only") } } }
+          ''',
+          'app/src/test/java/com/example/dependencybootstrap/BootstrapTest.kt': 'package com.example.dependencybootstrap\nimport org.junit.Test\nimport org.junit.Assert.assertEquals\nclass BootstrapTest { @Test fun check() { assertEquals(2, 1+1) } }\n'
+          }
+          for name, content in files.items():
+              p = Path(name); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(content)
+          Path('local.properties').write_text('sdk.dir=' + os.environ['ANDROID_HOME'] + '\n')
+          PY
+          gradle --no-daemon --max-workers=2 :app:assembleDebug :app:testDebugUnitTest :app:lintDebug :app:assembleDebugAndroidTest
+          gradle --stop
+          mkdir -p "$ROOT/android-sdk" "$ROOT/gradle-user-home/caches"
+          for ITEM in platforms/android-35 build-tools/35.0.0 platform-tools licenses; do
+            mkdir -p "$ROOT/android-sdk/$(dirname "$ITEM")"
+            cp -a "$ANDROID_HOME/$ITEM" "$ROOT/android-sdk/$ITEM"
+          done
+          cp -a "$HOME/.gradle/caches/modules-2" "$ROOT/gradle-user-home/caches/"
+          find "$ROOT/gradle-user-home" -name '*.lock' -delete
+      - name: Prepare public emulator tools
+        if: matrix.kind == 'emulator'
+        run: |
+          set -euo pipefail
+          sdkmanager 'emulator' 'system-images;android-29;default;x86_64'
+          ROOT="$RUNNER_TEMP/android-tools"
+          mkdir -p "$ROOT/android-sdk/system-images/android-29/default" "$ROOT/android-home/avd"
+          export ANDROID_USER_HOME="$ROOT/android-home"
+          export ANDROID_AVD_HOME="$ROOT/android-home/avd"
+          echo no | avdmanager create avd --name AndroidTest --path "$ROOT/android-home/avd/AndroidTest.avd" --package 'system-images;android-29;default;x86_64' --device pixel_2
+          cp -a "$ANDROID_HOME/emulator" "$ROOT/android-sdk/"
+          cp -a "$ANDROID_HOME/system-images/android-29/default/x86_64" "$ROOT/android-sdk/system-images/android-29/default/"
+          test -f "$ROOT/android-home/avd/AndroidTest.avd/config.ini"
+      - name: Encrypt temporary transfer for the requesting build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/android-tools"
+          OUT="$RUNNER_TEMP/encrypted-transfer"
+          mkdir -p "$OUT"
+          cat > "$RUNNER_TEMP/recipient.pem" <<'KEY'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAzYl0nehHE3BmveEoWbW1
+          wMjGkAMn2D328wg9JkAPEgVPvV2orxlAGWzJHW3T9tcfksXvThddgGHTPKBc1FV3
+          o7UdvFFfEfPbqxtrgnOg/W/KnSeflCEjFl8Pt2qt6UJbf6rd7Km55z1I64zx8V/Q
+          UH+0ICr1sG3yMcPe4XGhUub+OPySvZLN8Sa0SbAxNruPHnVhyS/cJxw/3vv/inxQ
+          FhmPeh99yuVVG/pvam2ikiRU8Ei63kIjtm24oQhOZ7FkCv9uCmV2ek6wSiER4hX7
+          27TXu0nDAsNvkK7+VlAJCZ9zDzsrivJunwvrfNmvF0/v++1XYng/rnsmUXmXs/oV
+          Gr4yCWCAouKZoN8okyZBWAKxfOpNIZ3IbnQTBYFJmPtaSG9MsFAJV+1X5Mo/lKhT
+          a4qQimZlv7ECvCVbsKnDV0xrDbva6vQlyCnLBt9k7Ci6zC5OUMWZVzWavfskyEqv
+          hWLn+t6RRTjiAfc7i8w0eoe84OQHE9+fAF6cLbvaOL2pAgMBAAE=
+          -----END PUBLIC KEY-----
+          KEY
+          tar -C "$ROOT" -czf "$RUNNER_TEMP/tools.tar.gz" .
+          (cd "$RUNNER_TEMP" && sha256sum tools.tar.gz) > "$OUT/sha256.txt"
+          openssl rand -hex 32 > "$RUNNER_TEMP/transfer-secret"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/tools.tar.gz" -out "$OUT/tools.enc" -pass file:"$RUNNER_TEMP/transfer-secret"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/recipient.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -in "$RUNNER_TEMP/transfer-secret" -out "$OUT/key.enc"
+          rm "$RUNNER_TEMP/transfer-secret" "$RUNNER_TEMP/tools.tar.gz"
+          du -h "$OUT/tools.enc"
+          cat "$OUT/sha256.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-android-${{ matrix.kind }}-transfer
+          path: ${{ runner.temp }}/encrypted-transfer/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
